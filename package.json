@@ -12,7 +12,9 @@
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
     "react-scripts": "5.0.1",
-    "web-vitals": "^2.1.4"
+    "sharp": "^0.34.5",
+    "web-vitals": "^2.1.4",
+    "ws": "^8.20.0"
   },
   "main": "public/electron.js",
   "homepage": "./",

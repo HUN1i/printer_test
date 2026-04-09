@@ -3,20 +3,28 @@ import './App.css';
 
 const PRINTER_CONFIG = {
   printer1: { label: 'PRINTER 1', name: 'HiTi P525T' },
-  printer2: { label: 'PRINTER 2', name: 'ID-81 Card Printer' },
+  printer2: { label: 'PRINTER 2', name: 'Rtai LUCA-40KM' },
 };
 
 function App() {
   const [printers, setPrinters] = useState([]);
   const [files, setFiles] = useState({ printer1: null, printer2: null });
+  const [filePaths, setFilePaths] = useState({ printer1: null, printer2: null });
   const [status, setStatus] = useState({ printer1: 'idle', printer2: 'idle' });
   const [messages, setMessages] = useState({ printer1: '', printer2: '' });
   const [progress, setProgress] = useState({ printer1: null, printer2: null });
   const [bothPrinting, setBothPrinting] = useState(false);
   const [hitiStatus, setHitiStatus] = useState(null); // HiTi SDK 상태
-  const [smartStatus, setSmartStatus] = useState(null); // Smart SDK 상태 (카드 프린터)
+  const [r600Status, setR600Status] = useState(null); // Retransfer 600 SDK 상태 (카드 프린터)
+  const [overlayPrinting, setOverlayPrinting] = useState(false);
+  const [overlayResult, setOverlayResult] = useState(null);
+  const [overlayProgress, setOverlayProgress] = useState(null);
+  const [overlayThreshold, setOverlayThreshold] = useState(220);
+  const [backFile, setBackFile] = useState(null); // 뒷면 파일명
+  const [backFilePath, setBackFilePath] = useState(null); // 뒷면 파일 경로
 
   // 결제 상태
+  const [terminalType, setTerminalType] = useState('nvc'); // 'nvc' | 'kis'
   const [paymentAmount, setPaymentAmount] = useState('');
   const [paymentInstallment, setPaymentInstallment] = useState('0');
   const [paymentStatus, setPaymentStatus] = useState('idle'); // idle, connecting, processing, success, error
@@ -83,16 +91,47 @@ function App() {
     }
   }, [isElectron]);
 
-  // Smart SDK 상태 조회 (카드 프린터)
-  const fetchSmartStatus = useCallback(async () => {
-    if (!isElectron || !window.electronAPI.getSmartStatus) return;
+  // R600 SDK 상태 조회 (카드 프린터)
+  const fetchR600Status = useCallback(async () => {
+    if (!isElectron || !window.electronAPI.getR600Status) return;
     try {
-      const result = await window.electronAPI.getSmartStatus(PRINTER_CONFIG.printer2.name);
-      setSmartStatus(result);
+      const result = await window.electronAPI.getR600Status();
+      setR600Status(result);
     } catch (err) {
-      console.error('Smart status fetch error:', err);
+      console.error('R600 status fetch error:', err);
     }
   }, [isElectron]);
+
+  // 뒷면 파일 선택
+  const handleSelectBack = useCallback(async () => {
+    if (!isElectron || !window.electronAPI.selectBackFile) return;
+    const result = await window.electronAPI.selectBackFile();
+    if (result.success) {
+      setBackFile(result.fileName);
+      setBackFilePath(result.filePath);
+    }
+  }, [isElectron]);
+
+  // 오버레이 출력
+  const handleOverlayPrint = useCallback(async () => {
+    if (!isElectron || !window.electronAPI.r600OverlayPrint) return;
+    if (!files.printer2) {
+      alert('앞면 이미지를 먼저 선택하세요.');
+      return;
+    }
+    setOverlayPrinting(true);
+    setOverlayResult(null);
+    setOverlayProgress('준비 중...');
+    try {
+      const result = await window.electronAPI.r600OverlayPrint(overlayThreshold, backFilePath);
+      setOverlayResult(result);
+    } catch (err) {
+      setOverlayResult({ success: false, error: err.message });
+    } finally {
+      setOverlayPrinting(false);
+      setOverlayProgress(null);
+    }
+  }, [isElectron, files.printer2, overlayThreshold, backFilePath]);
 
   useEffect(() => {
     if (isElectron) {
@@ -102,20 +141,24 @@ function App() {
         }
       });
       window.electronAPI.onPrintProgress(handleProgress);
+      if (window.electronAPI.onOverlayProgress) {
+        window.electronAPI.onOverlayProgress((detail) => setOverlayProgress(detail));
+      }
 
       // SDK 상태 최초 조회 + 10초 주기 폴링
       fetchHitiStatus();
-      fetchSmartStatus();
+      fetchR600Status();
       const hitiInterval = setInterval(fetchHitiStatus, 10000);
-      const smartInterval = setInterval(fetchSmartStatus, 10000);
+      const r600Interval = setInterval(fetchR600Status, 10000);
 
       return () => {
         window.electronAPI.removePrintProgress();
+        if (window.electronAPI.removeOverlayProgress) window.electronAPI.removeOverlayProgress();
         clearInterval(hitiInterval);
-        clearInterval(smartInterval);
+        clearInterval(r600Interval);
       };
     }
-  }, [isElectron, handleProgress, fetchHitiStatus, fetchSmartStatus]);
+  }, [isElectron, handleProgress, fetchHitiStatus, fetchR600Status]);
 
   const getStatusColor = (s) => {
     if (s === 'sending') return '#9b59b6';
@@ -140,9 +183,11 @@ function App() {
     const result = await window.electronAPI.selectFile(printerKey);
     if (result.success) {
       setFiles((prev) => ({ ...prev, [printerKey]: result.fileName }));
+      setFilePaths((prev) => ({ ...prev, [printerKey]: result.filePath }));
       // 파일 선택하면 상태 초기화
       setStatus((prev) => ({ ...prev, [printerKey]: 'idle' }));
       setMessages((prev) => ({ ...prev, [printerKey]: '' }));
+      setOverlayResult(null);
     }
   };
 
@@ -213,7 +258,8 @@ function App() {
     || status.printer2 === 'printing' || status.printer2 === 'sending';
 
   const isPrinter1Connected = printers.some((p) => p.name === PRINTER_CONFIG.printer1.name);
-  const isPrinter2Connected = printers.some((p) => p.name === PRINTER_CONFIG.printer2.name);
+  // Retransfer 600은 SDK로 직접 통신하므로 SDK 상태로 연결 여부 판단
+  const isPrinter2Connected = r600Status?.success === true;
 
   // 카메라 목록 조회
   const fetchCameras = useCallback(async () => {
@@ -298,7 +344,9 @@ function App() {
   const testPaymentConnection = async () => {
     if (!isElectron) return;
     setPaymentStatus('connecting');
-    const result = await window.electronAPI.paymentTestConnection();
+    const result = terminalType === 'kis'
+      ? await window.electronAPI.kisPaymentTestConnection()
+      : await window.electronAPI.paymentTestConnection();
     setPaymentTerminalConnected(result.success);
     setPaymentStatus('idle');
     setPaymentResult(result);
@@ -315,11 +363,14 @@ function App() {
     setPaymentStatus('processing');
     setPaymentResult(null);
     try {
-      const result = await window.electronAPI.paymentApprove({
+      const params = {
         amount,
         tax: Math.floor(amount / 11), // 부가세 자동 계산
         installment: parseInt(paymentInstallment, 10) || 0,
-      });
+      };
+      const result = terminalType === 'kis'
+        ? await window.electronAPI.kisPaymentApprove(params)
+        : await window.electronAPI.paymentApprove(params);
       setPaymentStatus(result.success ? 'success' : 'error');
       setPaymentResult(result);
     } catch (err) {
@@ -339,18 +390,29 @@ function App() {
     setPaymentStatus('processing');
     setPaymentResult(null);
     try {
-      const result = await window.electronAPI.paymentCancel({
+      const params = {
         amount,
         tax: Math.floor(amount / 11),
         orgApprovalNo: cancelApprovalNo,
         orgApprovalDate: cancelApprovalDate,
-      });
+      };
+      const result = terminalType === 'kis'
+        ? await window.electronAPI.kisPaymentCancel(params)
+        : await window.electronAPI.paymentCancel(params);
       setPaymentStatus(result.success ? 'success' : 'error');
       setPaymentResult(result);
     } catch (err) {
       setPaymentStatus('error');
       setPaymentResult({ success: false, error: err.message });
     }
+  };
+
+  // 단말기 타입 변경 시 연결 상태 초기화
+  const handleTerminalTypeChange = (type) => {
+    setTerminalType(type);
+    setPaymentTerminalConnected(null);
+    setPaymentResult(null);
+    setPaymentStatus('idle');
   };
 
   const renderPrinterCard = (printerKey, cardClass) => {
@@ -409,39 +471,114 @@ function App() {
           </div>
         )}
 
-        {printerKey === 'printer2' && smartStatus && (
+        {printerKey === 'printer2' && r600Status && (
           <div className="hiti-status-panel">
             <div className="hiti-status-row">
               <span className="hiti-label">프린터 상태</span>
-              <span className={`hiti-value ${smartStatus.status?.success ? smartStatus.status.key : 'error'}`}>
-                {smartStatus.status?.success ? smartStatus.status.label : (smartStatus.error || '연결 실패')}
+              <span className={`hiti-value ${r600Status.status?.success ? r600Status.status.key : 'error'}`}>
+                {r600Status.status?.success ? r600Status.status.label : (r600Status.error || '연결 실패')}
               </span>
             </div>
-            {smartStatus.ribbon?.success && (
+            {r600Status.ribbon?.success && (
               <>
                 <div className="hiti-status-row">
                   <span className="hiti-label">리본</span>
                   <span className="hiti-value">
-                    {`잔량 ${smartStatus.ribbon.remainCount}매 / ${smartStatus.ribbon.maxCount || '?'}매`}
+                    {`잔량 ${r600Status.ribbon.ribbonRemainPercent}%`}
                   </span>
                 </div>
                 <div className="ribbon-bar-container">
                   <div
                     className="ribbon-bar-fill"
-                    style={{ width: `${Math.min(100, Math.max(3, (smartStatus.ribbon.remainCount / (smartStatus.ribbon.maxCount || 500)) * 100))}%` }}
+                    style={{ width: `${Math.min(100, Math.max(3, r600Status.ribbon.ribbonRemainPercent))}%` }}
                   />
-                  <span className="ribbon-bar-text">{smartStatus.ribbon.remainCount}매 남음</span>
+                  <span className="ribbon-bar-text">{r600Status.ribbon.ribbonRemainPercent}% 남음</span>
+                </div>
+                <div className="hiti-status-row">
+                  <span className="hiti-label">전사필름</span>
+                  <span className="hiti-value">
+                    {`잔량 ${r600Status.ribbon.filmRemainPercent}%`}
+                  </span>
                 </div>
               </>
             )}
             <div className="hiti-status-row">
               <span className="hiti-label">총 출력 수</span>
               <span className="hiti-value">
-                {smartStatus.printCount?.success
-                  ? `${smartStatus.printCount.printCount.toLocaleString()}매`
-                  : (smartStatus.error || '조회 실패')}
+                {r600Status.printCount?.success
+                  ? `${r600Status.printCount.printCount.toLocaleString()}매`
+                  : (r600Status.error || '조회 실패')}
               </span>
             </div>
+            {r600Status.feeder && (
+              <div className="hiti-status-row">
+                <span className="hiti-label">카드 피더</span>
+                <span className="hiti-value">
+                  {r600Status.feeder.hasCard === true ? '카드 있음' : r600Status.feeder.hasCard === false ? '비어있음' : '확인 불가'}
+                </span>
+              </div>
+            )}
+            {r600Status.status?.success && (
+              <div className="hiti-status-row">
+                <span className="hiti-label">온도</span>
+                <span className="hiti-value">
+                  {`본체 ${r600Status.status.chassisTemp}°C / 헤드 ${r600Status.status.headTemp}°C`}
+                </span>
+              </div>
+            )}
+          </div>
+        )}
+
+        {printerKey === 'printer2' && (
+          <div className="overlay-section" style={{ marginTop: 10 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+              <button
+                className="file-select-btn printer-2"
+                onClick={handleSelectBack}
+                disabled={overlayPrinting}
+                style={{ fontSize: 12 }}
+              >
+                뒷면 선택
+              </button>
+              <span style={{ fontSize: 12, color: '#666' }}>
+                {backFile || '뒷면 없음 (단면)'}
+              </span>
+              {backFile && (
+                <button
+                  onClick={() => { setBackFile(null); setBackFilePath(null); }}
+                  style={{ fontSize: 11, color: '#999', background: 'none', border: 'none', cursor: 'pointer' }}
+                >
+                  X
+                </button>
+              )}
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+              <label style={{ fontSize: 12, color: '#666', whiteSpace: 'nowrap' }}>Threshold</label>
+              <input
+                type="range" min="0" max="255" value={overlayThreshold}
+                onChange={(e) => setOverlayThreshold(Number(e.target.value))}
+                disabled={overlayPrinting}
+                style={{ flex: 1 }}
+              />
+              <span style={{ fontSize: 12, fontWeight: 600, minWidth: 28 }}>{overlayThreshold}</span>
+            </div>
+            <button
+              className="print-btn btn-2"
+              onClick={handleOverlayPrint}
+              disabled={overlayPrinting || !selectedFile}
+            >
+              {overlayPrinting ? '오버레이 출력 중...' : (backFilePath ? '오버레이 양면 출력' : '오버레이 출력')}
+            </button>
+            {overlayPrinting && overlayProgress && (
+              <div style={{ marginTop: 6, fontSize: 13, color: '#f0ad4e', fontWeight: 600 }}>
+                {overlayProgress}
+              </div>
+            )}
+            {overlayResult && (
+              <div className={`status-message ${overlayResult.success ? 'success' : 'error'}`} style={{ marginTop: 6 }}>
+                {overlayResult.success ? overlayResult.message : overlayResult.error}
+              </div>
+            )}
           </div>
         )}
 
@@ -537,9 +674,22 @@ function App() {
         </div>
       )}
 
-      {/* 결제 단말기 (NVC-1000) */}
+      {/* 결제 단말기 */}
       <div className="payment-section">
-        <h2 className="payment-title">NVC-1000 결제 단말기</h2>
+        <h2 className="payment-title">카드 결제 단말기</h2>
+
+        <div className="payment-form-row" style={{ marginBottom: 12 }}>
+          <label>단말기 선택</label>
+          <select
+            className="payment-select"
+            value={terminalType}
+            onChange={(e) => handleTerminalTypeChange(e.target.value)}
+            disabled={paymentStatus === 'processing'}
+          >
+            <option value="nvc">NVC-1000 (나이스페이먼츠)</option>
+            <option value="kis">KIS (KIS정보통신)</option>
+          </select>
+        </div>
 
         <div className="payment-connection">
           <button className="payment-test-btn" onClick={testPaymentConnection} disabled={paymentStatus === 'processing'}>

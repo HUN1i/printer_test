@@ -3,12 +3,13 @@ const path = require('path');
 const { exec, spawn } = require('child_process');
 const { print } = require('pdf-to-printer');
 const { requestPayment, requestCancel, testConnection } = require('./payment');
+const { requestPaymentKis, requestCancelKis, testConnectionKis } = require('./paymentKis');
 
 let mainWindow;
 
 const PRINTERS = {
   printer1: 'HiTi P525T',
-  printer2: 'ID-81 Card Printer',
+  printer2: 'Rtai LUCA-40KM',
 };
 
 const selectedFiles = { printer1: null, printer2: null };
@@ -17,8 +18,12 @@ const selectedFiles = { printer1: null, printer2: null };
 const workers = {};
 
 function startWorker(type) {
+  // R600 워커는 SDK DLL 폴더를 cwd로 사용 (설정파일, 색상프로파일 등 필요)
+  const workerCwd = type === 'r600'
+    ? path.join(__dirname, '..', 'dll', 'r600')
+    : path.join(__dirname, '..');
   const proc = spawn('node', [path.join(__dirname, 'sdkWorker.js'), type], {
-    cwd: path.join(__dirname, '..'),
+    cwd: workerCwd,
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   const w = { proc, pending: new Map(), buffer: '', reqId: 0 };
@@ -32,10 +37,14 @@ function startWorker(type) {
       if (!line) continue;
       try {
         const msg = JSON.parse(line);
-        const p = w.pending.get(msg.id);
-        if (p) {
-          p.resolve(msg.result);
-          w.pending.delete(msg.id);
+        if (msg.type === 'progress' && mainWindow) {
+          mainWindow.webContents.send('overlay-progress', msg.detail);
+        } else {
+          const p = w.pending.get(msg.id);
+          if (p) {
+            p.resolve(msg.result);
+            w.pending.delete(msg.id);
+          }
         }
       } catch {}
     }
@@ -56,16 +65,7 @@ function sdkRequest(type, printerName) {
     if (!workers[type]) startWorker(type);
     const w = workers[type];
     const id = ++w.reqId;
-    const timeout = setTimeout(() => {
-      w.pending.delete(id);
-      resolve({ success: false, error: '시간 초과' });
-    }, 8000);
-    w.pending.set(id, {
-      resolve: (r) => {
-        clearTimeout(timeout);
-        resolve(r);
-      },
-    });
+    w.pending.set(id, { resolve });
     w.proc.stdin.write(JSON.stringify({ id, printerName }) + '\n');
   });
 }
@@ -169,24 +169,17 @@ function watchPrintJob(printerKey, printerName) {
   }, 500);
 }
 
-// Smart SDK 상태 폴링으로 카드 프린터 출력 완료 감지
+// R600 SDK 상태 폴링으로 카드 프린터 출력 완료 감지
 function watchPrintJobBySdk(printerKey) {
   let attempts = 0,
     wasPrinting = false;
   const poll = setInterval(async () => {
     attempts++;
     try {
-      const result = await sdkRequest('smart', '');
+      const result = await sdkRequest('r600', '');
       const key = result?.status?.key;
 
-      if (
-        key === 'printing' ||
-        key === 'card_in' ||
-        key === 'card_move' ||
-        key === 'card_flip' ||
-        key === 'ribbon_search' ||
-        key === 'ribbon_wind'
-      ) {
+      if (key === 'printing') {
         wasPrinting = true;
         mainWindow.webContents.send('print-progress', {
           printerKey,
@@ -194,7 +187,6 @@ function watchPrintJobBySdk(printerKey) {
           detail: result.status.label,
         });
       } else if (wasPrinting && key === 'ready') {
-        // 출력 동작 후 대기 상태 = 완료
         clearInterval(poll);
         mainWindow.webContents.send('print-progress', {
           printerKey,
@@ -313,9 +305,37 @@ ipcMain.handle('print-both', async () => {
 ipcMain.handle('get-hiti-status', (_, { printerName }) =>
   sdkRequest('hiti', printerName),
 );
-ipcMain.handle('get-smart-status', (_, { printerName }) =>
-  sdkRequest('smart', printerName),
+ipcMain.handle('get-r600-status', () =>
+  sdkRequest('r600', ''),
 );
+
+// 뒷면 파일 선택
+ipcMain.handle('select-back-file', async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: '뒷면 이미지 선택',
+    filters: [
+      { name: '이미지 파일', extensions: ['png', 'jpg', 'jpeg', 'bmp', 'tiff', 'tif'] },
+      { name: '모든 파일', extensions: ['*'] },
+    ],
+    properties: ['openFile'],
+  });
+  if (result.canceled || !result.filePaths.length) return { success: false, canceled: true };
+  return { success: true, filePath: result.filePaths[0], fileName: path.basename(result.filePaths[0]) };
+});
+
+// R600 오버레이 출력 (같은 이미지로 YMC + F/S/W, 양면 지원)
+ipcMain.handle('r600-overlay-print', async (_, { threshold = 220, backImagePath } = {}) => {
+  const imagePath = selectedFiles.printer2;
+  if (!imagePath) return { success: false, error: '이미지를 먼저 선택하세요' };
+
+  if (!workers['r600']) startWorker('r600');
+  const w = workers['r600'];
+  const id = ++w.reqId;
+  return new Promise((resolve) => {
+    w.pending.set(id, { resolve });
+    w.proc.stdin.write(JSON.stringify({ id, action: 'overlay-print', overlayImagePath: imagePath, threshold, backImagePath: backImagePath || null }) + '\n');
+  });
+});
 
 // ===== NVC-1000 결제 단말기 =====
 const PAYMENT_TERMINAL = { host: '192.168.45.162', port: 9200 };
@@ -364,6 +384,40 @@ ipcMain.handle('payment-cancel', async (_, params) => {
   }
 });
 
+// ===== KIS 카드단말기 (WebSocket CAT) =====
+const KIS_TERMINAL = { wsPort: 1516, endpoint: '' };
+
+ipcMain.handle('kis-payment-test-connection', async () => {
+  console.log(`[KIS] 연결 테스트: localhost:${KIS_TERMINAL.wsPort}`);
+  const result = await testConnectionKis(KIS_TERMINAL.wsPort, KIS_TERMINAL.endpoint);
+  console.log('[KIS] 연결 테스트 결과:', JSON.stringify(result));
+  return result;
+});
+
+ipcMain.handle('kis-payment-approve', async (_, params) => {
+  console.log('[KIS] 승인 요청:', JSON.stringify(params));
+  try {
+    const result = await requestPaymentKis(KIS_TERMINAL.wsPort, KIS_TERMINAL.endpoint, params);
+    console.log('[KIS] 승인 응답:', JSON.stringify(result));
+    return result;
+  } catch (err) {
+    console.error('[KIS] 승인 오류:', err.message, err.stack);
+    return { success: false, error: err.message };
+  }
+});
+
+ipcMain.handle('kis-payment-cancel', async (_, params) => {
+  console.log('[KIS] 취소 요청:', JSON.stringify(params));
+  try {
+    const result = await requestCancelKis(KIS_TERMINAL.wsPort, KIS_TERMINAL.endpoint, params);
+    console.log('[KIS] 취소 응답:', JSON.stringify(result));
+    return result;
+  } catch (err) {
+    console.error('[KIS] 취소 오류:', err.message, err.stack);
+    return { success: false, error: err.message };
+  }
+});
+
 app.whenReady().then(() => {
   // 카메라/마이크 권한 자동 허용
   session.defaultSession.setPermissionRequestHandler(
@@ -377,7 +431,7 @@ app.whenReady().then(() => {
   );
 
   startWorker('hiti');
-  startWorker('smart');
+  startWorker('r600');
   createWindow();
 });
 app.on('window-all-closed', () => {
