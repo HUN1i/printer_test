@@ -337,16 +337,16 @@ ipcMain.handle('r600-overlay-print', async (_, { threshold = 220, backImagePath 
   });
 });
 
-// ===== NVC-1000 결제 단말기 =====
-const PAYMENT_TERMINAL = { host: '192.168.45.162', port: 9200 };
+// ===== NVC-1000 결제 단말기 (시리얼) =====
+const PAYMENT_TERMINAL = { comPort: 'COM3', baudRate: 115200 };
 
 ipcMain.handle('payment-test-connection', async () => {
   console.log(
-    `[NVC-1000] 연결 테스트: ${PAYMENT_TERMINAL.host}:${PAYMENT_TERMINAL.port}`,
+    `[NVC-1000] 연결 테스트: ${PAYMENT_TERMINAL.comPort} (${PAYMENT_TERMINAL.baudRate}bps)`,
   );
   const result = await testConnection(
-    PAYMENT_TERMINAL.host,
-    PAYMENT_TERMINAL.port,
+    PAYMENT_TERMINAL.comPort,
+    PAYMENT_TERMINAL.baudRate,
   );
   console.log('[NVC-1000] 연결 테스트 결과:', JSON.stringify(result));
   return result;
@@ -356,8 +356,8 @@ ipcMain.handle('payment-approve', async (_, params) => {
   console.log('[NVC-1000] 승인 요청:', JSON.stringify(params));
   try {
     const result = await requestPayment(
-      PAYMENT_TERMINAL.host,
-      PAYMENT_TERMINAL.port,
+      PAYMENT_TERMINAL.comPort,
+      PAYMENT_TERMINAL.baudRate,
       params,
     );
     console.log('[NVC-1000] 승인 응답:', JSON.stringify(result));
@@ -372,8 +372,8 @@ ipcMain.handle('payment-cancel', async (_, params) => {
   console.log('[NVC-1000] 취소 요청:', JSON.stringify(params));
   try {
     const result = await requestCancel(
-      PAYMENT_TERMINAL.host,
-      PAYMENT_TERMINAL.port,
+      PAYMENT_TERMINAL.comPort,
+      PAYMENT_TERMINAL.baudRate,
       params,
     );
     console.log('[NVC-1000] 취소 응답:', JSON.stringify(result));

@@ -416,28 +416,59 @@ async function handleR600OverlayPrint(cmd) {
     log(`PrepareCanvas: ${ret}`);
     if (ret !== 0) return { success: false, error: `캔버스 준비 실패: ${r600GetErrorMsg(ret)}` };
 
+    // === 오버레이 마스크 생성 (살구색 등 밝은 피부톤 보호) ===
+    const sharp = require('sharp');
+
+    // RGB 채널 모두 threshold 이상인 픽셀만 흰색으로 처리한 마스크 생성
+    progress('오버레이 마스크 생성 중...');
+    const maskPath = imgPath.replace(/(\.\w+)$/, '_mask$1');
+    tempFiles.push(maskPath);
+
+    const { data: rawPixels, info } = await sharp(imgPath)
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+
+    const maskPixels = Buffer.alloc(rawPixels.length);
+    const channels = info.channels;
+    for (let i = 0; i < rawPixels.length; i += channels) {
+      const r = rawPixels[i], g = rawPixels[i + 1], b = rawPixels[i + 2];
+      // 진짜 흰색: R, G, B 모두 threshold 이상 + 채도가 낮음 (색차 작음)
+      const minCh = Math.min(r, g, b);
+      const maxCh = Math.max(r, g, b);
+      const isWhite = minCh >= threshold && (maxCh - minCh) < 40;
+      const val = isWhite ? 255 : 0;
+      maskPixels[i] = val;
+      maskPixels[i + 1] = val;
+      maskPixels[i + 2] = val;
+      if (channels === 4) maskPixels[i + 3] = rawPixels[i + 3]; // alpha 유지
+    }
+
+    await sharp(maskPixels, { raw: { width: info.width, height: info.height, channels: info.channels } })
+      .toFile(maskPath);
+    log(`오버레이 마스크 생성 완료: ${maskPath} (threshold=${threshold}, 채도제한=40)`);
+
     // === 데모 로그와 동일한 순서 ===
 
     // 1) SetAddImageMode_Rtai (None 모드 = 기본)
-    ret = R600SetAddImageMode_Rtai(0, true, true, null, threshold);
+    ret = R600SetAddImageMode_Rtai(0, true, true, maskPath, threshold);
     log(`SetAddImageMode_Rtai(1): ${ret}`);
 
     // 2) 컬러 이미지 (YMC) — 세로 54 x 86
-    ret = R600DrawImage(0, 0, 54, 86, imgPath, 1);
+    ret = R600DrawImage(-0.5, -0.5, 55, 87, imgPath, 1);
     log(`DrawImage: ${ret}`);
     if (ret !== 0) { R600ClearCanvas(); return { success: false, error: `이미지 실패: ${r600GetErrorMsg(ret)}` }; }
 
-    // 3) SetAddImageMode_Rtai (두 번째 - F/S/W 처리용)
-    ret = R600SetAddImageMode_Rtai(0, true, true, null, threshold);
+    // 3) SetAddImageMode_Rtai (두 번째 - F/S/W 처리용, 마스크 사용)
+    ret = R600SetAddImageMode_Rtai(0, true, true, maskPath, threshold);
     log(`SetAddImageMode_Rtai(2): ${ret}`);
 
-    // 4) F/S/W 마스크를 WaterMark로 그리기 (데모 핵심!)
-    ret = R600DrawWaterMark(0, 0, 54, 86, imgPath);
+    // 4) F/S/W 마스크를 WaterMark로 그리기
+    ret = R600DrawWaterMark(-0.5, -0.5, 55, 87, maskPath);
     log(`DrawWaterMark: ${ret}`);
     if (ret !== 0) { R600ClearCanvas(); return { success: false, error: `WaterMark 실패: ${r600GetErrorMsg(ret)}` }; }
 
     // 5) SetAddImageMode_Rtai (세 번째)
-    ret = R600SetAddImageMode_Rtai(0, true, true, null, threshold);
+    ret = R600SetAddImageMode_Rtai(0, true, true, maskPath, threshold);
     log(`SetAddImageMode_Rtai(3): ${ret}`);
 
     // 앞면 캔버스 커밋
@@ -447,22 +478,30 @@ async function handleR600OverlayPrint(cmd) {
     log(`CommitCanvas(front): ${ret}, len=${frontBufLen[0]}`);
     if (ret !== 0) return { success: false, error: `앞면 커밋 실패: ${r600GetErrorMsg(ret)}` };
 
-    // 뒷면 처리
+    // 뒷면 처리 (180도 회전)
     let backBuf = null;
     if (backPath) {
-      progress('뒷면 이미지 준비 중...');
+      progress('뒷면 이미지 준비 중 (180도 회전)...');
+
+      // 뒷면 이미지 180도 회전
+      const sharp = require('sharp');
+      const rotatedBackPath = backPath.replace(/(\.\w+)$/, '_rotated$1');
+      await sharp(backPath).rotate(180).toFile(rotatedBackPath);
+      tempFiles.push(rotatedBackPath);
+      log(`뒷면 180도 회전 완료: ${rotatedBackPath}`);
+
       R600SetCanvasPortrait(1);
       ret = R600PrepareCanvas(0, 0);
       log(`PrepareCanvas(back): ${ret}`);
       if (ret !== 0) return { success: false, error: `뒷면 캔버스 준비 실패: ${r600GetErrorMsg(ret)}` };
 
       ret = R600SetAddImageMode_Rtai(0, true, true, null, threshold);
-      ret = R600DrawImage(0, 0, 54, 86, backPath, 1);
+      ret = R600DrawImage(0, 0, 54, 86, rotatedBackPath, 1);
       log(`DrawImage(back): ${ret}`);
       if (ret !== 0) { R600ClearCanvas(); return { success: false, error: `뒷면 이미지 실패: ${r600GetErrorMsg(ret)}` }; }
 
       ret = R600SetAddImageMode_Rtai(0, true, true, null, threshold);
-      ret = R600DrawWaterMark(0, 0, 54, 86, backPath);
+      ret = R600DrawWaterMark(-0.5, -0.5, 55, 87, rotatedBackPath);
       log(`DrawWaterMark(back): ${ret}`);
       if (ret !== 0) { R600ClearCanvas(); return { success: false, error: `뒷면 WaterMark 실패: ${r600GetErrorMsg(ret)}` }; }
 

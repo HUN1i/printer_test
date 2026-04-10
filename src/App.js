@@ -25,7 +25,7 @@ function App() {
 
   // 결제 상태
   const [terminalType, setTerminalType] = useState('nvc'); // 'nvc' | 'kis'
-  const [paymentAmount, setPaymentAmount] = useState('');
+  const [paymentAmount, setPaymentAmount] = useState('1004');
   const [paymentInstallment, setPaymentInstallment] = useState('0');
   const [paymentStatus, setPaymentStatus] = useState('idle'); // idle, connecting, processing, success, error
   const [paymentResult, setPaymentResult] = useState(null);
